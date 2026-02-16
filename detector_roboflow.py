@@ -58,17 +58,23 @@ class Detector:
     
     def detect_persons(self, frame):
         """
-        Detect and track persons in the frame using YOLO11 with tracking.
+        Detect persons in the frame using YOLO11 with NMS.
         
         Args:
             frame: numpy array (BGR image)
         
         Returns:
-            List of detection dictionaries
+            List of detection dictionaries (deduplicated)
         """
         try:
-            # Use simple detection with lower confidence threshold for better detection
-            results = self.person_model.predict(frame, verbose=False, classes=[0], conf=0.25)  # class 0 = person, conf=0.25
+            # Use simple detection with higher IOU threshold for better NMS
+            results = self.person_model.predict(
+                frame, 
+                verbose=False, 
+                classes=[0],  # class 0 = person
+                conf=0.50,    # Higher confidence threshold
+                iou=0.5       # IoU threshold for NMS (higher = more aggressive deduplication)
+            )
             
             detections = []
             
@@ -80,29 +86,116 @@ class Detector:
                 if result.boxes is not None and len(result.boxes) > 0:
                     boxes = result.boxes
                     
+                    # Get frame dimensions for size filtering
+                    frame_height, frame_width = frame.shape[:2]
+                    min_person_height = frame_height * 0.20  # Increased from 0.15 to 0.20
+                    min_person_width = frame_width * 0.10    # Increased from 0.08 to 0.10
+                    
+                    # Collect all valid detections first
+                    valid_detections = []
+                    
                     # Parse each detection
                     for i in range(len(boxes)):
-                        # Use index as track_id (simple tracking)
-                        track_id = i + 1000
-                        
                         # Get bounding box coordinates (xyxy format)
                         bbox_tensor = boxes.xyxy[i]
                         x1, y1, x2, y2 = bbox_tensor.tolist()
                         
+                        # Calculate bbox dimensions
+                        bbox_width = x2 - x1
+                        bbox_height = y2 - y1
+                        
+                        # Filter out detections that are too small to be persons
+                        if bbox_height < min_person_height or bbox_width < min_person_width:
+                            print(f"[FILTER] Rejected small detection: {bbox_width:.0f}x{bbox_height:.0f} (min: {min_person_width:.0f}x{min_person_height:.0f})")
+                            continue
+                        
                         # Get confidence score
                         confidence = float(boxes.conf[i].item())
                         
-                        detections.append({
-                            'track_id': track_id,
+                        valid_detections.append({
                             'bbox': (int(x1), int(y1), int(x2), int(y2)),
                             'confidence': confidence
                         })
+                    
+                    # Apply additional NMS to be extra sure (in case YOLO's NMS wasn't aggressive enough)
+                    if len(valid_detections) > 1:
+                        valid_detections = self._apply_person_nms(valid_detections, iou_threshold=0.3)
+                    
+                    # Assign track IDs based on position (left to right)
+                    valid_detections.sort(key=lambda d: d['bbox'][0])  # Sort by x1 coordinate
+                    
+                    for idx, det in enumerate(valid_detections):
+                        detections.append({
+                            'track_id': idx + 1,  # Simple sequential ID
+                            'bbox': det['bbox'],
+                            'confidence': det['confidence']
+                        })
+            
+            if len(detections) > 0:
+                print(f"[PERSON] Detected {len(detections)} person(s)")
             
             return detections
         
         except Exception as e:
             print(f"[ERROR] Person detection failed: {str(e)}")
             return []
+    
+    def _apply_person_nms(self, detections, iou_threshold=0.3):
+        """
+        Apply NMS specifically for person detections.
+        
+        Args:
+            detections: List of detection dictionaries with bbox and confidence
+            iou_threshold: IoU threshold for merging overlapping detections
+            
+        Returns:
+            List of deduplicated detections
+        """
+        if len(detections) == 0:
+            return []
+        
+        # Sort by confidence (highest first)
+        detections.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        def calculate_iou(box1, box2):
+            """Calculate Intersection over Union"""
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
+            
+            # Intersection
+            x_left = max(x1_1, x1_2)
+            y_top = max(y1_1, y1_2)
+            x_right = min(x2_1, x2_2)
+            y_bottom = min(y2_1, y2_2)
+            
+            if x_right < x_left or y_bottom < y_top:
+                return 0.0
+            
+            intersection = (x_right - x_left) * (y_bottom - y_top)
+            
+            # Union
+            box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+            box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = box1_area + box2_area - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        # Apply NMS
+        keep = []
+        for detection in detections:
+            # Check if this detection overlaps with any kept detection
+            is_duplicate = False
+            for kept in keep:
+                iou = calculate_iou(detection['bbox'], kept['bbox'])
+                if iou > iou_threshold:
+                    is_duplicate = True
+                    print(f"[NMS] Removed duplicate person (IoU: {iou:.2f})")
+                    break
+            
+            if not is_duplicate:
+                keep.append(detection)
+        
+        return keep
     
     def detect_weapons(self, frame):
         """
@@ -113,7 +206,7 @@ class Detector:
             frame: numpy array (BGR image)
         
         Returns:
-            List of weapon detection dictionaries
+            List of weapon detection dictionaries (already deduplicated)
         """
         detections = []
         
@@ -121,7 +214,7 @@ class Detector:
         if self.weapon_model is not None:
             try:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                predictions = self.weapon_model.predict(frame_rgb, confidence=10).json()
+                predictions = self.weapon_model.predict(frame_rgb, confidence=35).json()  # Increased to 35
                 
                 if 'predictions' in predictions:
                     for pred in predictions['predictions']:
@@ -149,12 +242,10 @@ class Detector:
                 pass  # Silently fail and try YOLO method
         
         # Method 2: Use YOLO person model to detect weapon-like objects
-        # COCO classes: 43=knife, 44=spoon, 45=bowl, 46=banana, 47=apple, 48=sandwich, 49=orange, 50=broccoli, 51=carrot, 52=hot dog, 53=pizza, 54=donut, 55=cake, 56=chair, 57=couch, 58=potted plant, 59=bed, 60=dining table, 61=toilet, 62=tv, 63=laptop, 64=mouse, 65=remote, 66=keyboard, 67=cell phone, 68=microwave, 69=oven, 70=toaster, 71=sink, 72=refrigerator, 73=book, 74=clock, 75=vase, 76=scissors, 77=teddy bear, 78=hair drier, 79=toothbrush
-        # We want: 43=knife, 76=scissors, 32=sports ball, 33=kite, 34=baseball bat, 35=baseball glove, 36=skateboard, 37=surfboard, 38=tennis racket
         weapon_classes = [43, 76, 34]  # knife, scissors, baseball bat
         
         try:
-            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.15)
+            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.40)  # Increased to 0.40
             
             if results and len(results) > 0:
                 result = results[0]
@@ -189,4 +280,66 @@ class Detector:
         except Exception as e:
             print(f"[ERROR] YOLO weapon detection failed: {str(e)}")
         
+        # Apply NMS to remove duplicates from both detection methods
+        if len(detections) > 0:
+            detections = self._apply_nms(detections, iou_threshold=0.4)
+            print(f"[NMS] After deduplication: {len(detections)} unique weapons")
+        
         return detections
+    
+    def _apply_nms(self, detections, iou_threshold=0.4):
+        """
+        Apply Non-Maximum Suppression to remove duplicate detections.
+        
+        Args:
+            detections: List of detection dictionaries
+            iou_threshold: IoU threshold for considering detections as duplicates
+            
+        Returns:
+            List of deduplicated detections
+        """
+        if len(detections) == 0:
+            return []
+        
+        # Sort by confidence (highest first)
+        detections.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        def calculate_iou(box1, box2):
+            """Calculate Intersection over Union"""
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
+            
+            # Intersection
+            x_left = max(x1_1, x1_2)
+            y_top = max(y1_1, y1_2)
+            x_right = min(x2_1, x2_2)
+            y_bottom = min(y2_1, y2_2)
+            
+            if x_right < x_left or y_bottom < y_top:
+                return 0.0
+            
+            intersection = (x_right - x_left) * (y_bottom - y_top)
+            
+            # Union
+            box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+            box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = box1_area + box2_area - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        # Apply NMS
+        keep = []
+        for detection in detections:
+            # Check if this detection overlaps with any kept detection
+            is_duplicate = False
+            for kept in keep:
+                iou = calculate_iou(detection['bbox'], kept['bbox'])
+                # Consider duplicate if high IoU and same class
+                if iou > iou_threshold and detection['class'] == kept['class']:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                keep.append(detection)
+        
+        return keep

@@ -116,6 +116,10 @@ def process_video(config):
         fps_start = time.time()
         screenshot_captured = set()
         
+        # Weapon memory - remember weapons for 3 seconds even if not detected every frame
+        weapon_memory = []  # List of (frame_number, weapon_detection)
+        weapon_memory_timeout = 90  # Remember for 90 frames (~3 seconds at 30fps)
+        
         while state['running']:
             frame = state['video_source'].read()
             
@@ -129,12 +133,19 @@ def process_video(config):
             # Detection
             person_detections = state['detector'].detect_persons(frame)
             
-            # Detect weapons (every 5 frames instead of 2 to improve FPS)
+            # Detect weapons (every 3 frames for better detection)
             weapon_detections = []
-            if frame_count % 5 == 0:
+            if frame_count % 3 == 0:
                 weapon_detections = state['detector'].detect_weapons(frame)
+                # Detector already applies NMS, so we can use detections directly
                 if len(weapon_detections) > 0:
                     print(f"[FRAME {frame_count}] Weapons detected: {len(weapon_detections)}")
+                    # Clear old memory and add new detections
+                    weapon_memory = [(frame_count, w) for w in weapon_detections]
+            else:
+                # Use weapons from memory (within timeout)
+                weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
+                weapon_detections = [w for f, w in weapon_memory]
             
             # Tracking and behavior
             state['tracker_memory'].update(person_detections, frame_count)
@@ -170,10 +181,18 @@ def process_video(config):
                 alert_level = score_data['alert_level']
                 score = score_data['score']
                 
+                # If weapons detected, automatically upgrade to THREAT
+                if len(weapon_detections) > 0 and alert_level != 'THREAT':
+                    alert_level = 'THREAT'
+                    score = max(score, 5)  # Ensure threat level score
+                    print(f"[ALERT] Person ID {track_id} upgraded to THREAT due to weapons in scene")
+                
                 # Always emit alerts for any non-NORMAL level (every 30 frames to avoid spam)
                 if alert_level != 'NORMAL' and frame_count % 30 == 0:
                     # Create alert message
                     factors_str = ", ".join(score_data['factors']) if score_data['factors'] else "Multiple factors"
+                    if len(weapon_detections) > 0:
+                        factors_str += f", {len(weapon_detections)} weapon(s) in scene"
                     alert_msg = f"Person ID {track_id} - {alert_level} (Score: {score:.1f}) - {factors_str}"
                     
                     socketio.emit('alert', {
@@ -186,18 +205,6 @@ def process_video(config):
                     
                     print(f"[ALERT] {alert_level} - Person ID {track_id}, Score: {score:.1f}, Factors: {factors_str}")
                 
-                # For crowd situations, always generate alerts
-                if len(tracked_persons) > 3:  # If more than 3 people
-                    if frame_count % 60 == 0:  # Every 60 frames
-                        socketio.emit('alert', {
-                            'type': 'SUSPICIOUS',
-                            'message': f"Crowd detected - {len(tracked_persons)} people present",
-                            'time': datetime.now().strftime("%H:%M:%S"),
-                            'person_id': 0,
-                            'score': len(tracked_persons)
-                        })
-                        print(f"[ALERT] CROWD - {len(tracked_persons)} people detected")
-                
                 # Save screenshot for THREAT level
                 if alert_level == 'THREAT' and track_id not in screenshot_captured:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -207,6 +214,25 @@ def process_video(config):
                     
                     screenshot_captured.add(track_id)
                     print(f"[SCREENSHOT] Saved threat screenshot: {screenshot_path}")
+            
+            # For crowd situations, always generate alerts
+            if len(tracked_persons) > 3:  # If more than 3 people
+                if frame_count % 60 == 0:  # Every 60 frames
+                    socketio.emit('alert', {
+                        'type': 'SUSPICIOUS',
+                        'message': f"Crowd detected - {len(tracked_persons)} people present",
+                        'time': datetime.now().strftime("%H:%M:%S"),
+                        'person_id': 0,
+                        'score': len(tracked_persons)
+                    })
+                    print(f"[ALERT] CROWD - {len(tracked_persons)} people detected")
+            
+            # Recalculate threat count after weapon upgrade
+            threat_count = sum(1 for s in behaviour_scores.values() if s['alert_level'] == 'THREAT')
+            if len(weapon_detections) > 0:
+                threat_count = len(tracked_persons)  # All persons are threats if weapons present
+            
+            stats['threats'] = threat_count
             
             # Cleanup (less frequent for better FPS)
             if frame_count % 60 == 0:

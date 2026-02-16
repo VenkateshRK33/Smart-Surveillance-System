@@ -213,6 +213,7 @@ class BehaviourEngine:
     def _check_weapon_near_person(self, person_bbox, weapon_detections):
         """
         Check if any weapon bbox overlaps with person bbox using IoU.
+        Uses a more lenient proximity check to catch weapons near persons.
         
         Args:
             person_bbox: tuple (x1, y1, x2, y2) for person bounding box
@@ -226,10 +227,29 @@ class BehaviourEngine:
         
         px1, py1, px2, py2 = person_bbox
         
+        # Expand person bbox by 20% to catch nearby weapons
+        width = px2 - px1
+        height = py2 - py1
+        expand = 0.2
+        
+        px1_expanded = px1 - width * expand
+        py1_expanded = py1 - height * expand
+        px2_expanded = px2 + width * expand
+        py2_expanded = py2 + height * expand
+        
         for weapon in weapon_detections:
             wx1, wy1, wx2, wy2 = weapon['bbox']
             
-            # Calculate intersection area
+            # Check if weapon center is near person
+            weapon_center_x = (wx1 + wx2) / 2
+            weapon_center_y = (wy1 + wy2) / 2
+            
+            if (px1_expanded <= weapon_center_x <= px2_expanded and 
+                py1_expanded <= weapon_center_y <= py2_expanded):
+                print(f"[BEHAVIOR] Weapon '{weapon['class']}' associated with person")
+                return weapon['class']
+            
+            # Also check for any overlap
             intersection_x1 = max(px1, wx1)
             intersection_y1 = max(py1, wy1)
             intersection_x2 = min(px2, wx2)
@@ -237,18 +257,7 @@ class BehaviourEngine:
             
             # Check if there's an intersection
             if intersection_x1 < intersection_x2 and intersection_y1 < intersection_y2:
-                intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
-                
-                # Calculate union area
-                person_area = (px2 - px1) * (py2 - py1)
-                weapon_area = (wx2 - wx1) * (wy2 - wy1)
-                union_area = person_area + weapon_area - intersection_area
-                
-                # Calculate IoU (Intersection over Union)
-                iou = intersection_area / union_area if union_area > 0 else 0
-                
-                # If IoU > 0 (any overlap), consider weapon near person
-                if iou > 0:
-                    return weapon['class']
+                print(f"[BEHAVIOR] Weapon '{weapon['class']}' overlaps with person")
+                return weapon['class']
         
         return None
