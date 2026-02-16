@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upload Test</title>
+</head>
+<body>
+    <h1>Simple Upload Test</h1>
+    <input type="file" id="fileInput" accept="video/*">
+    <button onclick="testUpload()">Upload</button>
+    <div id="result"></div>
+
+    <script>
+        function testUpload() {
+            const fileInput = document.getElementById('fileInput');
+            const result = document.getElementById('result');
+            
+            if (!fileInput.files[0]) {
+                result.innerHTML = '<p style="color:red">No file selected</p>';
+                return;
+            }
+            
+            const file = fileInput.files[0];
+            result.innerHTML = `<p>Uploading ${file.name}...</p>`;
+            
+            const formData = new FormData();
+            formData.append('video', file);
+            
+            console.log('Sending request to /api/upload');
+            console.log('File:', file.name, file.size, 'bytes');
+            
+            fetch('/api/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                console.log('Response status:', response.status);
+                console.log('Response headers:', response.headers);
+                return response.json();
+            })
+            .then(data => {
+                console.log('Response data:', data);
+                result.innerHTML = `<p style="color:green">Success: ${JSON.stringify(data)}</p>`;
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                result.innerHTML = `<p style="color:red">Error: ${error.message}</p>`;
+            });
+        }
+    </script>
+</body>
+</html>
