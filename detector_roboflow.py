@@ -210,11 +210,11 @@ class Detector:
         """
         detections = []
         
-        # Method 1: Try Roboflow API
+        # Method 1: Try Roboflow API with lower confidence for better detection
         if self.weapon_model is not None:
             try:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                predictions = self.weapon_model.predict(frame_rgb, confidence=35).json()  # Increased to 35
+                predictions = self.weapon_model.predict(frame_rgb, confidence=25).json()  # Lowered to 25 for better gun detection
                 
                 if 'predictions' in predictions:
                     for pred in predictions['predictions']:
@@ -231,21 +231,32 @@ class Detector:
                         class_name = pred['class'].lower()
                         confidence = pred['confidence']
                         
+                        # Normalize weapon class names
+                        if 'gun' in class_name or 'pistol' in class_name or 'firearm' in class_name:
+                            weapon_type = 'gun'
+                        elif 'knife' in class_name or 'blade' in class_name:
+                            weapon_type = 'knife'
+                        elif 'bat' in class_name or 'stick' in class_name:
+                            weapon_type = 'bat'
+                        else:
+                            weapon_type = class_name
+                        
                         detections.append({
                             'bbox': (x1, y1, x2, y2),
-                            'class': class_name,
+                            'class': weapon_type,
                             'confidence': confidence
                         })
                         
-                        print(f"[ROBOFLOW WEAPON] {class_name} - confidence: {confidence:.2f}")
+                        print(f"[ROBOFLOW WEAPON] {weapon_type} ({class_name}) - confidence: {confidence:.2f}")
             except Exception as e:
-                pass  # Silently fail and try YOLO method
+                print(f"[WARNING] Roboflow detection failed: {e}")
         
         # Method 2: Use YOLO person model to detect weapon-like objects
-        weapon_classes = [43, 76, 34]  # knife, scissors, baseball bat
+        # COCO classes: 43=knife, 76=scissors, 34=baseball bat
+        weapon_classes = [43, 76, 34]
         
         try:
-            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.40)  # Increased to 0.40
+            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.35)  # Lowered to 0.35
             
             if results and len(results) > 0:
                 result = results[0]
@@ -280,9 +291,9 @@ class Detector:
         except Exception as e:
             print(f"[ERROR] YOLO weapon detection failed: {str(e)}")
         
-        # Apply NMS to remove duplicates from both detection methods
+        # Apply aggressive NMS to remove duplicates from both detection methods
         if len(detections) > 0:
-            detections = self._apply_nms(detections, iou_threshold=0.4)
+            detections = self._apply_nms(detections, iou_threshold=0.5)  # Increased from 0.4 to 0.5 for more aggressive deduplication
             print(f"[NMS] After deduplication: {len(detections)} unique weapons")
         
         return detections

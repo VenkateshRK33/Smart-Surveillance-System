@@ -78,6 +78,49 @@ def upload_video():
 
 def process_video(config):
     """Process video and emit frames via WebSocket"""
+    
+    def _deduplicate_weapons(weapons):
+        """Deduplicate weapons using aggressive NMS"""
+        if len(weapons) == 0:
+            return []
+        
+        # Sort by confidence
+        weapons.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        def calculate_iou(box1, box2):
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
+            
+            x_left = max(x1_1, x1_2)
+            y_top = max(y1_1, y1_2)
+            x_right = min(x2_1, x2_2)
+            y_bottom = min(y2_1, y2_2)
+            
+            if x_right < x_left or y_bottom < y_top:
+                return 0.0
+            
+            intersection = (x_right - x_left) * (y_bottom - y_top)
+            box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+            box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = box1_area + box2_area - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        keep = []
+        for weapon in weapons:
+            is_duplicate = False
+            for kept in keep:
+                iou = calculate_iou(weapon['bbox'], kept['bbox'])
+                # More aggressive: consider duplicate if IoU > 0.3 OR same class
+                if iou > 0.3 and weapon['class'] == kept['class']:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                keep.append(weapon)
+        
+        print(f"[DEDUPE] Reduced {len(weapons)} weapons to {len(keep)} unique")
+        return keep
+    
     try:
         print("\n" + "="*60)
         print("STARTING VIDEO PROCESSING")
@@ -116,9 +159,13 @@ def process_video(config):
         fps_start = time.time()
         screenshot_captured = set()
         
-        # Weapon memory - remember weapons for 3 seconds even if not detected every frame
+        # Persistent counters - these accumulate and don't reset
+        max_weapons_detected = 0  # Track maximum weapons seen
+        max_threats_detected = 0  # Track maximum threats seen
+        
+        # Weapon memory - remember weapons for longer (5 seconds)
         weapon_memory = []  # List of (frame_number, weapon_detection)
-        weapon_memory_timeout = 90  # Remember for 90 frames (~3 seconds at 30fps)
+        weapon_memory_timeout = 150  # Remember for 150 frames (~5 seconds at 30fps)
         
         while state['running']:
             frame = state['video_source'].read()
@@ -136,16 +183,31 @@ def process_video(config):
             # Detect weapons (every 3 frames for better detection)
             weapon_detections = []
             if frame_count % 3 == 0:
-                weapon_detections = state['detector'].detect_weapons(frame)
+                new_weapons = state['detector'].detect_weapons(frame)
                 # Detector already applies NMS, so we can use detections directly
-                if len(weapon_detections) > 0:
-                    print(f"[FRAME {frame_count}] Weapons detected: {len(weapon_detections)}")
-                    # Clear old memory and add new detections
-                    weapon_memory = [(frame_count, w) for w in weapon_detections]
+                if len(new_weapons) > 0:
+                    print(f"[FRAME {frame_count}] Weapons detected: {len(new_weapons)}")
+                    # Replace memory with new detections (don't accumulate)
+                    weapon_memory = [(frame_count, w) for w in new_weapons]
+                else:
+                    # Clean up old weapon memory if no new detections
+                    weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
             else:
-                # Use weapons from memory (within timeout)
+                # Clean up old weapon memory (remove weapons older than timeout)
                 weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
-                weapon_detections = [w for f, w in weapon_memory]
+            
+            # Get unique weapons from memory using NMS
+            if len(weapon_memory) > 0:
+                all_weapons = [w for f, w in weapon_memory]
+                # Apply aggressive NMS to deduplicate weapons in memory
+                weapon_detections = _deduplicate_weapons(all_weapons)
+            else:
+                weapon_detections = []
+            
+            # Update max weapons counter (persistent) - only update if we have actual detections
+            if len(weapon_detections) > 0 and len(weapon_detections) > max_weapons_detected:
+                max_weapons_detected = len(weapon_detections)
+                print(f"[PERSISTENT] Max weapons updated: {max_weapons_detected}")
             
             # Tracking and behavior
             state['tracker_memory'].update(person_detections, frame_count)
@@ -164,15 +226,19 @@ def process_video(config):
             fps = frame_count / (time.time() - fps_start) if time.time() > fps_start else 0
             state['ui_overlay'].draw_fps(frame, fps)
             
-            # Stats
+            # Stats with crowd-based suspicious activity
             threat_count = sum(1 for s in behaviour_scores.values() if s['alert_level'] == 'THREAT')
             suspicious_count = sum(1 for s in behaviour_scores.values() if s['alert_level'] == 'SUSPICIOUS')
+            
+            # Add suspicious activity for crowds (2 or more people)
+            if len(tracked_persons) >= 2:
+                suspicious_count = max(suspicious_count, len(tracked_persons) - 1)
             
             stats = {
                 'persons': len(tracked_persons),
                 'suspicious': suspicious_count,
                 'threats': threat_count,
-                'weapons': len(weapon_detections),
+                'weapons': max_weapons_detected,  # Use persistent counter
                 'fps': int(fps)
             }
             
@@ -216,11 +282,11 @@ def process_video(config):
                     print(f"[SCREENSHOT] Saved threat screenshot: {screenshot_path}")
             
             # For crowd situations, always generate alerts
-            if len(tracked_persons) > 3:  # If more than 3 people
+            if len(tracked_persons) >= 2:  # If 2 or more people
                 if frame_count % 60 == 0:  # Every 60 frames
                     socketio.emit('alert', {
                         'type': 'SUSPICIOUS',
-                        'message': f"Crowd detected - {len(tracked_persons)} people present",
+                        'message': f"Multiple people detected - {len(tracked_persons)} people present",
                         'time': datetime.now().strftime("%H:%M:%S"),
                         'person_id': 0,
                         'score': len(tracked_persons)
@@ -232,7 +298,12 @@ def process_video(config):
             if len(weapon_detections) > 0:
                 threat_count = len(tracked_persons)  # All persons are threats if weapons present
             
-            stats['threats'] = threat_count
+            # Update max threats counter (persistent)
+            if threat_count > max_threats_detected:
+                max_threats_detected = threat_count
+                print(f"[PERSISTENT] Max threats updated: {max_threats_detected}")
+            
+            stats['threats'] = max_threats_detected  # Use persistent counter
             
             # Cleanup (less frequent for better FPS)
             if frame_count % 60 == 0:
