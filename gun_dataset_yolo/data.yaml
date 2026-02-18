@@ -1,0 +1,8 @@
+# Gun Detection Dataset
+path: D:\ALL -repo\Smart-Surveillance-System\gun_dataset_yolo
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ['gun']

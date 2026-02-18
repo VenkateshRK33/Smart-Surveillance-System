@@ -14,14 +14,15 @@ class Detector:
     Uses YOLO11 for person detection with tracking and Roboflow API for weapon detection.
     """
     
-    def __init__(self, person_model_path, roboflow_api_key, roboflow_model_id):
+    def __init__(self, person_model_path, roboflow_api_key=None, roboflow_model_id=None, gun_model_path=None):
         """
-        Initialize Detector with YOLO11 for persons and Roboflow API for weapons.
+        Initialize Detector with YOLO11 for persons and custom gun detection model.
         
         Args:
             person_model_path: Path to YOLO11 model file (e.g., 'models/yolo11n.pt')
-            roboflow_api_key: Roboflow API key
-            roboflow_model_id: Roboflow model ID (e.g., 'crime-dp3x3/1')
+            roboflow_api_key: Roboflow API key (deprecated, kept for compatibility)
+            roboflow_model_id: Roboflow model ID (deprecated, kept for compatibility)
+            gun_model_path: Path to custom trained gun detection model
         
         Raises:
             Exception: If person model loading fails
@@ -33,28 +34,22 @@ class Detector:
         except Exception as e:
             raise Exception(f"Failed to load person model from {person_model_path}: {str(e)}")
         
-        # Initialize Roboflow for weapon detection
-        self.weapon_model = None
-        try:
-            print(f"[INFO] Initializing Roboflow crime detection...")
-            rf = Roboflow(api_key=roboflow_api_key)
-            
-            # Parse model ID (format: project/version)
-            parts = roboflow_model_id.split('/')
-            if len(parts) == 2:
-                project_name, version = parts
-                workspace = "bahria-university-g0y7w"
-            else:
-                raise ValueError("Invalid model ID format")
-            
-            project = rf.workspace(workspace).project(project_name)
-            self.weapon_model = project.version(int(version)).model
-            
-            print(f"[INFO] Roboflow crime detection initialized")
-            print(f"[INFO] Using hosted model: {roboflow_model_id}")
-        except Exception as e:
-            print(f"[WARNING] Failed to initialize Roboflow weapon detection: {str(e)}")
-            print("[WARNING] Weapon detection will be disabled")
+        # Load custom trained gun detection model
+        self.gun_model = None
+        if gun_model_path:
+            try:
+                import os
+                if os.path.exists(gun_model_path):
+                    self.gun_model = YOLO(gun_model_path)
+                    print(f"[INFO] Loaded custom gun detection model: {gun_model_path}")
+                else:
+                    print(f"[WARNING] Gun model not found at {gun_model_path}")
+                    print("[INFO] Gun detection will use YOLO COCO classes only")
+            except Exception as e:
+                print(f"[ERROR] Failed to load gun model: {str(e)}")
+                print("[INFO] Gun detection will use YOLO COCO classes only")
+        else:
+            print("[INFO] No gun model specified - using YOLO COCO classes for weapon detection")
     
     def detect_persons(self, frame):
         """
@@ -199,7 +194,7 @@ class Detector:
     
     def detect_weapons(self, frame):
         """
-        Detect weapons using BOTH Roboflow API AND YOLO COCO classes.
+        Detect weapons using custom trained gun model AND YOLO COCO classes.
         This dual approach increases detection accuracy.
         
         Args:
@@ -210,59 +205,48 @@ class Detector:
         """
         detections = []
         
-        # Method 1: Try Roboflow API with lower confidence for better detection
-        if self.weapon_model is not None:
+        # Method 1: Use custom trained gun detection model
+        if self.gun_model is not None:
             try:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                predictions = self.weapon_model.predict(frame_rgb, confidence=25).json()  # Lowered to 25 for better gun detection
+                results = self.gun_model.predict(frame, verbose=False, conf=0.30)  # 30% confidence threshold
                 
-                if 'predictions' in predictions:
-                    for pred in predictions['predictions']:
-                        x_center = pred['x']
-                        y_center = pred['y']
-                        width = pred['width']
-                        height = pred['height']
+                if results and len(results) > 0:
+                    result = results[0]
+                    
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        boxes = result.boxes
+                        print(f"[GUN MODEL] Found {len(boxes)} gun(s)")
                         
-                        x1 = int(x_center - width / 2)
-                        y1 = int(y_center - height / 2)
-                        x2 = int(x_center + width / 2)
-                        y2 = int(y_center + height / 2)
-                        
-                        class_name = pred['class'].lower()
-                        confidence = pred['confidence']
-                        
-                        # Normalize weapon class names
-                        if 'gun' in class_name or 'pistol' in class_name or 'firearm' in class_name:
-                            weapon_type = 'gun'
-                        elif 'knife' in class_name or 'blade' in class_name:
-                            weapon_type = 'knife'
-                        elif 'bat' in class_name or 'stick' in class_name:
-                            weapon_type = 'bat'
-                        else:
-                            weapon_type = class_name
-                        
-                        detections.append({
-                            'bbox': (x1, y1, x2, y2),
-                            'class': weapon_type,
-                            'confidence': confidence
-                        })
-                        
-                        print(f"[ROBOFLOW WEAPON] {weapon_type} ({class_name}) - confidence: {confidence:.2f}")
+                        for i in range(len(boxes)):
+                            bbox_tensor = boxes.xyxy[i]
+                            x1, y1, x2, y2 = bbox_tensor.tolist()
+                            
+                            confidence = float(boxes.conf[i].item())
+                            
+                            detections.append({
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'class': 'gun',
+                                'confidence': confidence
+                            })
+                            
+                            print(f"[GUN DETECTED] confidence: {confidence:.2f}")
+            
             except Exception as e:
-                print(f"[WARNING] Roboflow detection failed: {e}")
+                print(f"[ERROR] Gun model detection failed: {str(e)}")
         
         # Method 2: Use YOLO person model to detect weapon-like objects
         # COCO classes: 43=knife, 76=scissors, 34=baseball bat
         weapon_classes = [43, 76, 34]
         
         try:
-            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.35)  # Lowered to 0.35
+            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.20)
             
             if results and len(results) > 0:
                 result = results[0]
                 
                 if result.boxes is not None and len(result.boxes) > 0:
                     boxes = result.boxes
+                    print(f"[YOLO] Found {len(boxes)} weapon-like objects")
                     
                     for i in range(len(boxes)):
                         bbox_tensor = boxes.xyxy[i]
@@ -290,11 +274,65 @@ class Detector:
         
         except Exception as e:
             print(f"[ERROR] YOLO weapon detection failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
         
         # Apply aggressive NMS to remove duplicates from both detection methods
         if len(detections) > 0:
-            detections = self._apply_nms(detections, iou_threshold=0.5)  # Increased from 0.4 to 0.5 for more aggressive deduplication
+            print(f"[WEAPON DETECTION] Total detections before NMS: {len(detections)}")
+            detections = self._apply_nms(detections, iou_threshold=0.5)
             print(f"[NMS] After deduplication: {len(detections)} unique weapons")
+        else:
+            print("[WEAPON DETECTION] No weapons detected in this frame")
+        
+        return detections
+    
+    def detect_suspicious_items(self, frame):
+        """
+        Detect suspicious items and behaviors like masks, hoods, face coverings.
+        Uses YOLO to detect items that might indicate suspicious activity.
+        
+        Args:
+            frame: numpy array (BGR image)
+        
+        Returns:
+            List of suspicious item detections
+        """
+        detections = []
+        
+        try:
+            # COCO classes that might indicate suspicious behavior:
+            # 27=backpack, 28=umbrella, 31=handbag, 33=suitcase
+            # We'll focus on backpack and suitcase as they could be used to conceal items
+            suspicious_classes = [27, 33]  # backpack, suitcase
+            
+            results = self.person_model.predict(frame, verbose=False, classes=suspicious_classes, conf=0.40)
+            
+            if results and len(results) > 0:
+                result = results[0]
+                
+                if result.boxes is not None and len(result.boxes) > 0:
+                    boxes = result.boxes
+                    
+                    for i in range(len(boxes)):
+                        bbox_tensor = boxes.xyxy[i]
+                        x1, y1, x2, y2 = bbox_tensor.tolist()
+                        
+                        class_id = int(boxes.cls[i].item())
+                        class_name = result.names[class_id].lower()
+                        confidence = float(boxes.conf[i].item())
+                        
+                        detections.append({
+                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                            'class': class_name,
+                            'confidence': confidence,
+                            'type': 'suspicious_item'
+                        })
+                        
+                        print(f"[SUSPICIOUS ITEM] {class_name} - confidence: {confidence:.2f}")
+        
+        except Exception as e:
+            print(f"[ERROR] Suspicious item detection failed: {str(e)}")
         
         return detections
     

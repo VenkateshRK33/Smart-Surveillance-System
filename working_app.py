@@ -140,10 +140,11 @@ def process_video(config):
         # Initialize components
         state['video_source'] = VideoSource(video_path)
         
+        # Initialize detector with custom trained gun model
+        gun_model_path = 'runs/detect/models/gun_detection/weights/best.pt'
         state['detector'] = Detector(
-            'models/yolo11n.pt',
-            'qkYj4oT3poy5wf50aKm2',
-            'crime-dp3x3/1'  # New crime detection model
+            person_model_path='models/yolo11n.pt',
+            gun_model_path=gun_model_path
         )
         
         state['tracker_memory'] = TrackerMemory()
@@ -180,21 +181,24 @@ def process_video(config):
             # Detection
             person_detections = state['detector'].detect_persons(frame)
             
-            # Detect weapons (every 3 frames for better detection)
+            # Detect weapons EVERY FRAME for maximum detection (especially for guns)
             weapon_detections = []
-            if frame_count % 3 == 0:
-                new_weapons = state['detector'].detect_weapons(frame)
-                # Detector already applies NMS, so we can use detections directly
-                if len(new_weapons) > 0:
-                    print(f"[FRAME {frame_count}] Weapons detected: {len(new_weapons)}")
-                    # Replace memory with new detections (don't accumulate)
-                    weapon_memory = [(frame_count, w) for w in new_weapons]
-                else:
-                    # Clean up old weapon memory if no new detections
-                    weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
+            new_weapons = state['detector'].detect_weapons(frame)
+            
+            if len(new_weapons) > 0:
+                print(f"[FRAME {frame_count}] Weapons detected: {len(new_weapons)}")
+                # Replace memory with new detections (don't accumulate)
+                weapon_memory = [(frame_count, w) for w in new_weapons]
             else:
-                # Clean up old weapon memory (remove weapons older than timeout)
+                # Clean up old weapon memory if no new detections
                 weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
+            
+            # Detect suspicious items (every 5 frames)
+            suspicious_items = []
+            if frame_count % 5 == 0:
+                suspicious_items = state['detector'].detect_suspicious_items(frame)
+                if len(suspicious_items) > 0:
+                    print(f"[FRAME {frame_count}] Suspicious items detected: {len(suspicious_items)}")
             
             # Get unique weapons from memory using NMS
             if len(weapon_memory) > 0:
@@ -216,7 +220,8 @@ def process_video(config):
             behaviour_scores = state['behaviour_engine'].calculate_scores(
                 tracked_persons,
                 weapon_detections,
-                frame.shape
+                frame.shape,
+                suspicious_items  # Add suspicious items parameter
             )
             
             # Draw overlays
@@ -318,7 +323,7 @@ def process_video(config):
                 'stats': stats
             })
             
-            time.sleep(0.015)  # ~60 FPS target
+            time.sleep(0.001)  # Minimal sleep for maximum FPS (~1000 FPS target, actual will be limited by processing)
         
         print("Processing stopped")
         
