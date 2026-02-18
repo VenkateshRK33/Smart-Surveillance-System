@@ -195,7 +195,7 @@ class Detector:
     def detect_weapons(self, frame):
         """
         Detect weapons using custom trained gun model AND YOLO COCO classes.
-        This dual approach increases detection accuracy.
+        Prioritizes YOLO detections (bat, knife) over gun model to avoid false positives.
         
         Args:
             frame: numpy array (BGR image)
@@ -204,42 +204,16 @@ class Detector:
             List of weapon detection dictionaries (already deduplicated)
         """
         detections = []
+        yolo_weapon_detections = []  # Track YOLO detections separately
+        has_bat_or_knife = False  # Flag to disable gun model if bat/knife detected
         
-        # Method 1: Use custom trained gun detection model
-        if self.gun_model is not None:
-            try:
-                results = self.gun_model.predict(frame, verbose=False, conf=0.30)  # 30% confidence threshold
-                
-                if results and len(results) > 0:
-                    result = results[0]
-                    
-                    if result.boxes is not None and len(result.boxes) > 0:
-                        boxes = result.boxes
-                        print(f"[GUN MODEL] Found {len(boxes)} gun(s)")
-                        
-                        for i in range(len(boxes)):
-                            bbox_tensor = boxes.xyxy[i]
-                            x1, y1, x2, y2 = bbox_tensor.tolist()
-                            
-                            confidence = float(boxes.conf[i].item())
-                            
-                            detections.append({
-                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                                'class': 'gun',
-                                'confidence': confidence
-                            })
-                            
-                            print(f"[GUN DETECTED] confidence: {confidence:.2f}")
-            
-            except Exception as e:
-                print(f"[ERROR] Gun model detection failed: {str(e)}")
-        
-        # Method 2: Use YOLO person model to detect weapon-like objects
+        # Method 1: Use YOLO person model to detect weapon-like objects FIRST
         # COCO classes: 43=knife, 76=scissors, 34=baseball bat
+        # We do this first because YOLO is more reliable for these specific objects
         weapon_classes = [43, 76, 34]
         
         try:
-            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.20)
+            results = self.person_model.predict(frame, verbose=False, classes=weapon_classes, conf=0.25)
             
             if results and len(results) > 0:
                 result = results[0]
@@ -259,16 +233,21 @@ class Detector:
                         # Map class names
                         if 'knife' in class_name or 'scissors' in class_name:
                             weapon_type = 'knife'
+                            has_bat_or_knife = True
                         elif 'bat' in class_name:
                             weapon_type = 'bat'
+                            has_bat_or_knife = True  # Disable gun model when bat detected
                         else:
                             weapon_type = 'weapon'
                         
-                        detections.append({
+                        detection = {
                             'bbox': (int(x1), int(y1), int(x2), int(y2)),
                             'class': weapon_type,
                             'confidence': confidence
-                        })
+                        }
+                        
+                        detections.append(detection)
+                        yolo_weapon_detections.append(detection)  # Keep track for conflict resolution
                         
                         print(f"[YOLO WEAPON] {weapon_type} ({class_name}) - confidence: {confidence:.2f}")
         
@@ -277,7 +256,39 @@ class Detector:
             import traceback
             traceback.print_exc()
         
-        # Apply aggressive NMS to remove duplicates from both detection methods
+        # Method 2: Use custom trained gun detection model
+        # ONLY if no bat or knife was detected by YOLO
+        if self.gun_model is not None and not has_bat_or_knife:
+            try:
+                results = self.gun_model.predict(frame, verbose=False, conf=0.45)
+                
+                if results and len(results) > 0:
+                    result = results[0]
+                    
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        boxes = result.boxes
+                        print(f"[GUN MODEL] Found {len(boxes)} potential gun(s)")
+                        
+                        for i in range(len(boxes)):
+                            bbox_tensor = boxes.xyxy[i]
+                            x1, y1, x2, y2 = bbox_tensor.tolist()
+                            gun_bbox = (int(x1), int(y1), int(x2), int(y2))
+                            
+                            confidence = float(boxes.conf[i].item())
+                            
+                            detections.append({
+                                'bbox': gun_bbox,
+                                'class': 'gun',
+                                'confidence': confidence
+                            })
+                            print(f"[GUN DETECTED] confidence: {confidence:.2f}")
+            
+            except Exception as e:
+                print(f"[ERROR] Gun model detection failed: {str(e)}")
+        elif has_bat_or_knife:
+            print("[GUN MODEL] Disabled - bat/knife detected by YOLO")
+        
+        # Apply NMS to remove any remaining duplicates
         if len(detections) > 0:
             print(f"[WEAPON DETECTION] Total detections before NMS: {len(detections)}")
             detections = self._apply_nms(detections, iou_threshold=0.5)
@@ -286,6 +297,29 @@ class Detector:
             print("[WEAPON DETECTION] No weapons detected in this frame")
         
         return detections
+    
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union between two boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Intersection
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Union
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = box1_area + box2_area - intersection
+        
+        return intersection / union if union > 0 else 0.0
     
     def detect_suspicious_items(self, frame):
         """

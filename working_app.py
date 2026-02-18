@@ -111,9 +111,10 @@ def process_video(config):
             is_duplicate = False
             for kept in keep:
                 iou = calculate_iou(weapon['bbox'], kept['bbox'])
-                # More aggressive: consider duplicate if IoU > 0.3 OR same class
-                if iou > 0.3 and weapon['class'] == kept['class']:
+                # Very aggressive: consider duplicate if IoU > 0.2 OR same class with any overlap
+                if (iou > 0.2 and weapon['class'] == kept['class']) or iou > 0.4:
                     is_duplicate = True
+                    print(f"[DEDUPE] Removed duplicate {weapon['class']} (IoU: {iou:.2f})")
                     break
             if not is_duplicate:
                 keep.append(weapon)
@@ -140,11 +141,11 @@ def process_video(config):
         # Initialize components
         state['video_source'] = VideoSource(video_path)
         
-        # Initialize detector with custom trained gun model
-        gun_model_path = 'runs/detect/models/gun_detection/weights/best.pt'
+        # Initialize detector WITHOUT gun model (disabled due to false positives)
+        # Only YOLO weapon detection (bat, knife) will be used
         state['detector'] = Detector(
             person_model_path='models/yolo11n.pt',
-            gun_model_path=gun_model_path
+            gun_model_path=None  # Disabled
         )
         
         state['tracker_memory'] = TrackerMemory()
@@ -164,9 +165,18 @@ def process_video(config):
         max_weapons_detected = 0  # Track maximum weapons seen
         max_threats_detected = 0  # Track maximum threats seen
         
-        # Weapon memory - remember weapons for longer (5 seconds)
+        # Weapon memory - remember weapons for shorter time (1 second only)
         weapon_memory = []  # List of (frame_number, weapon_detection)
-        weapon_memory_timeout = 150  # Remember for 150 frames (~5 seconds at 30fps)
+        weapon_memory_timeout = 30  # Remember for 30 frames (~1 second at 30fps)
+        
+        # Get detection settings from config
+        enable_person_detection = config.get('personDetection', True)
+        enable_weapon_detection = config.get('weaponDetection', True)
+        enable_behavior_analysis = config.get('behaviorAnalysis', True)
+        
+        print(f"[CONFIG] Person Detection: {enable_person_detection}")
+        print(f"[CONFIG] Weapon Detection: {enable_weapon_detection}")
+        print(f"[CONFIG] Behavior Analysis: {enable_behavior_analysis}")
         
         while state['running']:
             frame = state['video_source'].read()
@@ -178,51 +188,65 @@ def process_video(config):
             
             frame_count += 1
             
-            # Detection
-            person_detections = state['detector'].detect_persons(frame)
+            # Detection - only if enabled
+            person_detections = []
+            if enable_person_detection:
+                person_detections = state['detector'].detect_persons(frame)
             
-            # Detect weapons EVERY FRAME for maximum detection (especially for guns)
+            # Detect weapons EVERY FRAME - only if enabled
             weapon_detections = []
-            new_weapons = state['detector'].detect_weapons(frame)
-            
-            if len(new_weapons) > 0:
-                print(f"[FRAME {frame_count}] Weapons detected: {len(new_weapons)}")
-                # Replace memory with new detections (don't accumulate)
-                weapon_memory = [(frame_count, w) for w in new_weapons]
+            if enable_weapon_detection:
+                new_weapons = state['detector'].detect_weapons(frame)
+                
+                if len(new_weapons) > 0:
+                    print(f"[FRAME {frame_count}] Weapons detected: {len(new_weapons)}")
+                    # REPLACE memory completely with new detections (don't accumulate!)
+                    weapon_memory = [(frame_count, w) for w in new_weapons]
+                else:
+                    # Clean up old weapon memory aggressively
+                    weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
             else:
-                # Clean up old weapon memory if no new detections
-                weapon_memory = [(f, w) for f, w in weapon_memory if frame_count - f < weapon_memory_timeout]
+                weapon_memory = []  # Clear memory if weapon detection disabled
             
-            # Detect suspicious items (every 5 frames)
+            # Detect suspicious items (every 5 frames) - only if behavior analysis enabled
             suspicious_items = []
-            if frame_count % 5 == 0:
+            if enable_behavior_analysis and frame_count % 5 == 0:
                 suspicious_items = state['detector'].detect_suspicious_items(frame)
                 if len(suspicious_items) > 0:
                     print(f"[FRAME {frame_count}] Suspicious items detected: {len(suspicious_items)}")
             
-            # Get unique weapons from memory using NMS
+            # Get unique weapons from memory - apply VERY aggressive deduplication
             if len(weapon_memory) > 0:
                 all_weapons = [w for f, w in weapon_memory]
                 # Apply aggressive NMS to deduplicate weapons in memory
                 weapon_detections = _deduplicate_weapons(all_weapons)
+                print(f"[MEMORY] {len(all_weapons)} weapons in memory -> {len(weapon_detections)} after deduplication")
             else:
                 weapon_detections = []
             
-            # Update max weapons counter (persistent) - only update if we have actual detections
-            if len(weapon_detections) > 0 and len(weapon_detections) > max_weapons_detected:
-                max_weapons_detected = len(weapon_detections)
-                print(f"[PERSISTENT] Max weapons updated: {max_weapons_detected}")
+            # Use CURRENT weapon count (what's actually detected right now)
+            current_weapon_count = len(weapon_detections)
             
-            # Tracking and behavior
-            state['tracker_memory'].update(person_detections, frame_count)
-            tracked_persons = state['tracker_memory'].get_all()
-            
-            behaviour_scores = state['behaviour_engine'].calculate_scores(
-                tracked_persons,
-                weapon_detections,
-                frame.shape,
-                suspicious_items  # Add suspicious items parameter
-            )
+            # Tracking and behavior - only if person detection enabled
+            if enable_person_detection:
+                state['tracker_memory'].update(person_detections, frame_count)
+                tracked_persons = state['tracker_memory'].get_all()
+                
+                # Calculate behavior scores only if behavior analysis enabled
+                if enable_behavior_analysis:
+                    behaviour_scores = state['behaviour_engine'].calculate_scores(
+                        tracked_persons,
+                        weapon_detections if enable_weapon_detection else [],
+                        frame.shape,
+                        suspicious_items
+                    )
+                else:
+                    # No behavior analysis - empty scores
+                    behaviour_scores = {}
+            else:
+                # No person detection - return empty dict (not list!)
+                tracked_persons = {}
+                behaviour_scores = {}
             
             # Draw overlays
             state['ui_overlay'].draw(frame, tracked_persons, behaviour_scores)
@@ -243,7 +267,7 @@ def process_video(config):
                 'persons': len(tracked_persons),
                 'suspicious': suspicious_count,
                 'threats': threat_count,
-                'weapons': max_weapons_detected,  # Use persistent counter
+                'weapons': current_weapon_count,  # Use current count, not persistent max
                 'fps': int(fps)
             }
             

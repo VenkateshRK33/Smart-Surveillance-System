@@ -33,8 +33,6 @@ const elements = {
     changeFileBtn: document.getElementById('changeFileBtn'),
     enableZone: document.getElementById('enableZone'),
     zoneConfig: document.getElementById('zoneConfig'),
-    confidenceLevel: document.getElementById('confidenceLevel'),
-    confidenceValue: document.getElementById('confidenceValue'),
     personCount: document.getElementById('personCount'),
     suspiciousCount: document.getElementById('suspiciousCount'),
     threatCount: document.getElementById('threatCount'),
@@ -117,11 +115,6 @@ function initializeEventListeners() {
     // Zone toggle
     elements.enableZone.addEventListener('change', (e) => {
         elements.zoneConfig.style.display = e.target.checked ? 'block' : 'none';
-    });
-
-    // Confidence slider
-    elements.confidenceLevel.addEventListener('input', (e) => {
-        elements.confidenceValue.textContent = e.target.value + '%';
     });
 }
 
@@ -254,8 +247,6 @@ function getConfiguration() {
         personDetection: document.getElementById('personDetection').checked,
         weaponDetection: document.getElementById('weaponDetection').checked,
         behaviorAnalysis: document.getElementById('behaviorAnalysis').checked,
-        crowdThreshold: parseInt(document.getElementById('crowdThreshold').value),
-        confidence: parseInt(elements.confidenceLevel.value) / 100,
         restrictedZone: elements.enableZone.checked ? {
             x1: parseInt(document.getElementById('zoneX1').value) || 0,
             y1: parseInt(document.getElementById('zoneY1').value) || 0,
